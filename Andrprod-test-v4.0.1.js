@@ -998,3 +998,1062 @@
 
             var out = [];
             var i, r;
+            for (i = 0; i < results.length; i++) {
+                r = results[i];
+
+                // 1. Языковой фильтр (например, можно отключить английский)
+                if (r.langCode === 'uk' && !langs.uk) continue;
+                if (r.langCode === 'ru' && !langs.ru) continue;
+                if (r.langCode === 'en' && !langs.en) continue;
+                if (r.langCode === 'other' && !langs.other) continue;
+
+                // 2. Минимальное / максимальное качество (строго по реальным данным!)
+                if (minQ > 0) {
+                    if (r.qualityNum === 0 && hideUnmatched) continue;
+                    if (r.qualityNum > 0 && r.qualityNum < minQ) continue;
+                }
+                if (maxQ > 0 && r.qualityNum > maxQ) continue;
+
+                // 3. Предпочитаемая озвучка (если включено скрытие неподходящих)
+                if (prefVoice !== 'any' && hideUnmatched && r.voice) {
+                    var vLow = r.voice.toLowerCase();
+                    if (prefVoice === 'dub' && vLow.indexOf('дубляж') === -1 && vLow.indexOf('dub') === -1) continue;
+                    if (prefVoice === 'orig' && vLow.indexOf('оригинал') === -1 && vLow.indexOf('orig') === -1) continue;
+                }
+
+                out.push(r);
+            }
+
+            return FilterEngine.sort(out, StorageManager.getSortBy());
+        },
+
+        sort: function (list, sortBy) {
+            var prio = StorageManager.getPriorities();
+            var copy = list.slice(0);
+            copy.sort(function (a, b) {
+                if (sortBy === 'name') return String(a.sourceName).localeCompare(String(b.sourceName));
+                if (sortBy === 'quality') {
+                    if (a.qualityNum !== b.qualityNum) return b.qualityNum - a.qualityNum;
+                    return (a.latency || 99999) - (b.latency || 99999);
+                }
+                if (sortBy === 'speed') {
+                    return (a.latency || 99999) - (b.latency || 99999);
+                }
+                var pa = prio.indexOf(a.pluginId);
+                var pb = prio.indexOf(b.pluginId);
+                if (pa !== -1 && pb !== -1 && pa !== pb) return pa - pb;
+                if (pa !== -1 && pb === -1) return -1;
+                if (pb !== -1 && pa === -1) return 1;
+                if (a.qualityNum !== b.qualityNum) return b.qualityNum - a.qualityNum;
+                return String(a.sourceName).localeCompare(String(b.sourceName));
+            });
+            return copy;
+        }
+    };
+
+    // =========================================================================
+    // 9. ЕДИНЫЙ ПАРАЛЛЕЛЬНЫЙ ПОИСК И КЕШ РЕЗУЛЬТАТОВ (UnifiedSearchEngine)
+    // =========================================================================
+    var SearchCache = {
+        TTL_MS: 300000, // 5 минут
+        store: {},
+        makeKey: function (meta, scopeId) {
+            return (meta.mediaType || 'movie') + ':' + (meta.tmdbId || meta.title) + ':' + (scopeId || 'all');
+        },
+        get: function (meta, scopeId) {
+            var entry = SearchCache.store[SearchCache.makeKey(meta, scopeId)];
+            if (entry && (Date.now() - entry.savedAt) < SearchCache.TTL_MS) return entry.state;
+            return null;
+        },
+        set: function (meta, scopeId, state) {
+            SearchCache.store[SearchCache.makeKey(meta, scopeId)] = { savedAt: Date.now(), state: state };
+        },
+        clear: function (meta, scopeId) {
+            delete SearchCache.store[SearchCache.makeKey(meta, scopeId)];
+        }
+    };
+
+    var UnifiedSearchEngine = {
+        activeSessionId: 0,
+        activeNetHandles: [],
+        activeTimers: [],
+
+        cancelActiveSearch: function () {
+            UnifiedSearchEngine.activeSessionId++;
+            var i;
+            for (i = 0; i < UnifiedSearchEngine.activeNetHandles.length; i++) {
+                try { UnifiedSearchEngine.activeNetHandles[i].clear(); } catch (e) {}
+            }
+            for (i = 0; i < UnifiedSearchEngine.activeTimers.length; i++) {
+                try { clearTimeout(UnifiedSearchEngine.activeTimers[i]); } catch (e2) {}
+            }
+            UnifiedSearchEngine.activeNetHandles = [];
+            UnifiedSearchEngine.activeTimers = [];
+            return UnifiedSearchEngine.activeSessionId;
+        },
+        _trackNet: function (net) { if (net) UnifiedSearchEngine.activeNetHandles.push(net); },
+        _trackTimer: function (t) { if (t) UnifiedSearchEngine.activeTimers.push(t); },
+
+        /**
+         * Параллельный поиск по всем разрешённым источникам (или по одному выбранному scopePluginId).
+         */
+        search: function (card, explicitMethod, scopePluginId, forceRefresh, callbacks) {
+            callbacks = callbacks || {};
+            var mediaMeta = TitleResolver.extractMediaMeta(card, explicitMethod);
+            var scope = scopePluginId || 'all';
+
+            if (!forceRefresh) {
+                var cached = SearchCache.get(mediaMeta, scope);
+                if (cached) {
+                    if (callbacks.onComplete) callbacks.onComplete(cached);
+                    return cached;
+                }
+            } else {
+                SearchCache.clear(mediaMeta, scope);
+            }
+
+            var sessionId = UnifiedSearchEngine.cancelActiveSearch();
+            var t0 = Date.now();
+            SourceRegistry.resetAndScan();
+
+            var allAdapters = SourceRegistry.getAdapters();
+            var targetAdapters = [];
+            var i;
+            for (i = 0; i < allAdapters.length; i++) {
+                var info = allAdapters[i].getSourceInfo();
+                // Строго не отправляем запросы отключённым источникам!
+                if (!StorageManager.isSourceEnabled(info.id)) continue;
+                if (scope !== 'all' && info.id !== scope) continue;
+                targetAdapters.push(allAdapters[i]);
+            }
+
+            var state = {
+                sessionId: sessionId,
+                mediaMeta: mediaMeta,
+                scope: scope,
+                statusText: targetAdapters.length ? 'Поиск источников...' : 'Нет активных источников',
+                isSearching: targetAdapters.length > 0,
+                cancelled: false,
+                statuses: {},
+                results: [],
+                completed: 0,
+                total: targetAdapters.length,
+                durationMs: 0
+            };
+
+            if (!targetAdapters.length) {
+                Diagnostics.lastSearchAt = Date.now();
+                Diagnostics.lastSearchDurationMs = 0;
+                Diagnostics.lastResultCount = 0;
+                if (callbacks.onComplete) callbacks.onComplete(state);
+                return state;
+            }
+
+            for (i = 0; i < targetAdapters.length; i++) {
+                var inf = targetAdapters[i].getSourceInfo();
+                state.statuses[inf.id] = { info: inf, status: 'searching', label: 'Поиск...', count: 0, error: '' };
+            }
+            if (callbacks.onUpdate) callbacks.onUpdate(state);
+
+            for (i = 0; i < targetAdapters.length; i++) {
+                (function (adapter) {
+                    var info = adapter.getSourceInfo();
+                    var searchFn = mediaMeta.isSeries ? adapter.searchSeries : adapter.searchMovie;
+                    searchFn(mediaMeta, { sessionId: sessionId }, function (outcome) {
+                        if (sessionId !== UnifiedSearchEngine.activeSessionId) return;
+
+                        outcome = outcome || { status: 'error', error: 'Пустой ответ адаптера', results: [] };
+                        var list = outcome.results || [];
+                        state.statuses[info.id] = {
+                            info: info,
+                            status: outcome.status,
+                            label: outcome.status === 'found' ? ('Найдено: ' + list.length)
+                                : (outcome.status === 'empty' ? 'Ничего не найдено'
+                                : (outcome.status === 'unsupported' ? 'Только кнопка плагина' : 'Ошибка')),
+                            count: list.length,
+                            error: outcome.error || ''
+                        };
+
+                        if (list.length) {
+                            state.results = UnifiedSearchEngine.deduplicate(state.results, list);
+                        }
+
+                        state.completed++;
+                        state.durationMs = Date.now() - t0;
+                        state.statusText = state.completed < state.total
+                            ? ('Источник ' + info.name + ' завершил поиск (' + state.completed + '/' + state.total + ') • Найдено: ' + state.results.length)
+                            : ('Поиск завершён • Найдено вариантов: ' + state.results.length);
+
+                        if (state.completed >= state.total) {
+                            state.isSearching = false;
+                            Diagnostics.lastSearchAt = Date.now();
+                            Diagnostics.lastSearchDurationMs = state.durationMs;
+                            Diagnostics.lastResultCount = state.results.length;
+                            SearchCache.set(mediaMeta, scope, state);
+                            if (callbacks.onComplete) callbacks.onComplete(state);
+                        } else if (callbacks.onUpdate) {
+                            callbacks.onUpdate(state);
+                        }
+                    });
+                })(targetAdapters[i]);
+            }
+
+            return state;
+        },
+
+        /**
+         * Удаляет точные дубликаты, сохраняя разные озвучки, качества, форматы и источники.
+         */
+        deduplicate: function (existing, incoming) {
+            var seen = {};
+            var out = [];
+            var all = (existing || []).concat(incoming || []);
+            var i, r, sig;
+            for (i = 0; i < all.length; i++) {
+                r = all[i];
+                sig = [
+                    r.pluginId,
+                    String(r.sourceName || '').toLowerCase(),
+                    String(r.qualityNum || 0),
+                    String(r.voice || '').toLowerCase(),
+                    String(r.langCode || ''),
+                    String(r.format || '').toLowerCase(),
+                    String(r.season || ''),
+                    String(r.episode || ''),
+                    safeTrim(r.streamUrl)
+                ].join('|');
+                if (!seen[sig]) {
+                    seen[sig] = true;
+                    out.push(r);
+                }
+            }
+            return out;
+        },
+
+        checkAllSources: function (onEach, onDone) {
+            SourceRegistry.resetAndScan();
+            var adapters = SourceRegistry.getAdapters();
+            var total = adapters.length;
+            if (!total) { if (onDone) onDone({}); return; }
+            var finished = 0;
+            var results = {};
+            var i;
+            for (i = 0; i < total; i++) {
+                (function (ad) {
+                    var info = ad.getSourceInfo();
+                    ad.isAvailable(function (ok, msg, latency) {
+                        var rec = { id: info.id, name: info.name, ok: !!ok, message: msg || '', latency: latency || 0, checkedAt: Date.now() };
+                        results[info.id] = rec;
+                        Diagnostics.lastCheckResults[info.id] = rec;
+                        finished++;
+                        if (onEach) onEach(rec);
+                        if (finished >= total && onDone) onDone(results);
+                    });
+                })(adapters[i]);
+            }
+        }
+    };
+
+    // =========================================================================
+    // 10. КАРТОЧКА ФИЛЬМА/СЕРИАЛА И ФИКС ПОВТОРНОГО НАЖАТИЯ (CardIntegration)
+    // =========================================================================
+    var CardIntegration = {
+        initialized: false,
+        lastMovie: null,
+        lastMethod: '',
+
+        init: function () {
+            if (CardIntegration.initialized) return;
+            if (!Lampa.Listener || typeof Lampa.Listener.follow !== 'function') {
+                Diagnostics.logError('CardIntegration', 'Lampa.Listener.follow недоступен');
+                return;
+            }
+            CardIntegration.initialized = true;
+            Diagnostics.cardIntegrationActive = true;
+
+            Lampa.Listener.follow('full', function (e) {
+                if (e && e.type === 'complite') {
+                    Diagnostics.lastCardEventAt = Date.now();
+                    try { CardIntegration.attachToCard(e); }
+                    catch (err) { Diagnostics.logError('CardIntegration.attach', err); }
+                }
+            });
+        },
+
+        attachToCard: function (event) {
+            var render = event.object && event.object.activity && typeof event.object.activity.render === 'function'
+                ? event.object.activity.render()
+                : null;
+            if (!render || !render.length) return;
+
+            var container = render.find('.full-start-new__buttons');
+            if (!container.length) container = render.find('.full-start__buttons');
+            if (!container.length) return;
+
+            container.find('.andrprod-card-btn').off('hover:enter').remove();
+
+            var movie = (event.data && event.data.movie) ? event.data.movie : (event.object && event.object.card ? event.object.card : {});
+            var method = (event.object && event.object.method) ? event.object.method : '';
+            CardIntegration.lastMovie = movie;
+            CardIntegration.lastMethod = method;
+
+            var btn = $(
+                '<div class="full-start__button selector andrprod-card-btn" data-andrprod="1">' +
+                    BrandIcons.getLogoSvg('andrprod-card-btn__logo', 'card_' + (movie.id || '0')) +
+                '</div>'
+            );
+            container.prepend(btn);
+
+            btn.on('hover:enter', function () {
+                Lampa.Activity.push({
+                    url: '',
+                    title: PLUGIN_NAME,
+                    component: SEARCH_COMPONENT,
+                    movie: movie,
+                    method: method,
+                    scope: 'all',
+                    page: 1
+                });
+            });
+        },
+
+        /**
+         * ИСПРАВЛЕНИЕ БАГА ПОВТОРНОГО НАЖАТИЯ (Раздел 9):
+         * Всегда ищет ЖИВУЮ прикреплённую кнопку в активном DOM карточки фильма/сериала.
+         * Если открыт экран ANDRPROD поверх карточки — сначала безопасно возвращается
+         * в карточку через Lampa.Activity.backward(), затем нажимает живую кнопку плагина.
+         */
+        launchPluginLiveButton: function (pluginId) {
+            var prof = null;
+            var i;
+            for (i = 0; i < ONLINE_PLUGIN_WHITELIST.length; i++) {
+                if (ONLINE_PLUGIN_WHITELIST[i].id === pluginId) { prof = ONLINE_PLUGIN_WHITELIST[i]; break; }
+            }
+            var hints = prof ? prof.buttonHints : [pluginId];
+
+            function findAndTriggerLive() {
+                var btns = $('.full-start-new__buttons .full-start__button, .full-start__buttons .full-start__button, .full-start-new__buttons [class*="lampac--button"], .full-start__buttons [class*="lampac--button"]');
+                var matchedEl = null;
+                btns.each(function () {
+                    if (matchedEl) return;
+                    var el = $(this);
+                    if (el.hasClass('andrprod-card-btn')) return;
+                    var txt = safeTrim(el.find('span').text() || el.attr('aria-label') || el.attr('title') || el.text()).toLowerCase();
+                    var cls = String(el.attr('class') || '').toLowerCase();
+                    var h;
+                    for (h = 0; h < hints.length; h++) {
+                        if (txt.indexOf(hints[h]) !== -1 || cls.indexOf(hints[h]) !== -1) {
+                            matchedEl = el;
+                            return;
+                        }
+                    }
+                });
+                if (matchedEl && matchedEl.length) {
+                    if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ' → ' + (prof ? prof.name : pluginId));
+                    matchedEl.trigger('hover:enter');
+                    return true;
+                }
+                return false;
+            }
+
+            if (findAndTriggerLive()) return true;
+
+            // Если находимся на экране ANDRPROD поверх карточки — возвращаемся в карточку и нажимаем живую кнопку
+            try {
+                if (Lampa.Activity && typeof Lampa.Activity.backward === 'function') {
+                    Lampa.Activity.backward();
+                    var attempts = 0;
+                    var retryTimer = setInterval(function () {
+                        attempts++;
+                        if (findAndTriggerLive()) {
+                            clearInterval(retryTimer);
+                            return;
+                        }
+                        if (attempts >= 12) {
+                            clearInterval(retryTimer);
+                            if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Кнопка плагина «' + (prof ? prof.name : pluginId) + '» не найдена в карточке.');
+                        }
+                    }, 250);
+                    return true;
+                }
+            } catch (e) {
+                Diagnostics.logError('CardIntegration.liveButton', e);
+            }
+            return false;
+        }
+    };
+
+    // =========================================================================
+    // 11. ГЛАВНЫЙ ЭКРАН АГРЕГАТОРА (AndrprodSearchComponent)
+    // =========================================================================
+    function AndrprodSearchComponent(object) {
+        var movie = (object && object.movie) ? object.movie : (CardIntegration.lastMovie || {});
+        var method = (object && object.method) ? object.method : (CardIntegration.lastMethod || '');
+        var scope = (object && object.scope) ? object.scope : 'all';
+        var mediaMeta = TitleResolver.extractMediaMeta(movie, method);
+
+        var scroll = new Lampa.Scroll({ mask: true, over: true });
+        var html = $('<div class="andrprod-hub"></div>');
+        var headerEl = null;
+        var statusEl = null;
+        var bodyEl = null;
+        var lastFocused = null;
+        var state = null;
+        var isDestroyed = false;
+
+        this.create = function () {
+            buildShell();
+            if (StorageManager.getSearchMode() !== 'manual') {
+                startSearch(false);
+            } else {
+                renderBody();
+            }
+            return this.render();
+        };
+
+        function startSearch(forceRefresh) {
+            state = UnifiedSearchEngine.search(movie, method, scope, forceRefresh, {
+                onUpdate: function (st) { if (!isDestroyed) { state = st; renderStatusAndBody(true); } },
+                onComplete: function (st) { if (!isDestroyed) { state = st; renderStatusAndBody(true); } }
+            });
+            renderStatusAndBody(false);
+        }
+
+        function buildShell() {
+            html.empty();
+            var posterStyle = mediaMeta.poster ? ('background-image:url(\'' + mediaMeta.poster + '\')') : '';
+            headerEl = $(
+                '<div class="andrprod-hero">' +
+                    '<div class="andrprod-hero__poster" style="' + posterStyle + '"></div>' +
+                    '<div class="andrprod-hero__info">' +
+                        BrandIcons.getLogoSvg('andrprod-hero__logo', 'search') +
+                        '<div class="andrprod-hero__title">' + escapeHtml(mediaMeta.title) + (mediaMeta.year ? ' (' + escapeHtml(mediaMeta.year) + ')' : '') + '</div>' +
+                        '<div class="andrprod-hero__meta">' +
+                            (mediaMeta.isSeries ? 'Сериал' : 'Фильм') +
+                            (mediaMeta.originalTitle && mediaMeta.originalTitle !== mediaMeta.title ? ' • ' + escapeHtml(mediaMeta.originalTitle) : '') +
+                            (mediaMeta.rating ? ' • ★ ' + escapeHtml(mediaMeta.rating) : '') +
+                            (mediaMeta.numberOfSeasons ? ' • Сезонов: ' + mediaMeta.numberOfSeasons : '') +
+                        '</div>' +
+                        '<div class="andrprod-hero__status"></div>' +
+                        '<div class="andrprod-hero__actions">' +
+                            '<div class="andrprod-pill selector andrprod-act-search">Обновить поиск</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-cancel">Отменить поиск</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-scope">Источник: ' + escapeHtml(getScopeName(scope)) + '</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-sources">Выбрать источники</div>' +
+                            '<div class="andrprod-pill selector andrprod-act-diag">Диагностика</div>' +
+                        '</div>' +
+                    '</div>' +
+                '</div>'
+            );
+
+            statusEl = headerEl.find('.andrprod-hero__status');
+            headerEl.find('.andrprod-act-search').on('hover:enter', function () { startSearch(true); });
+            headerEl.find('.andrprod-act-cancel').on('hover:enter', function () {
+                UnifiedSearchEngine.cancelActiveSearch();
+                if (state) { state.isSearching = false; state.cancelled = true; state.statusText = 'Поиск отменён пользователем'; }
+                renderStatusAndBody(true);
+            });
+            headerEl.find('.andrprod-act-scope').on('hover:enter', openScopePicker);
+            headerEl.find('.andrprod-act-sources').on('hover:enter', function () { HubLauncher.open({ view: 'sources' }); });
+            headerEl.find('.andrprod-act-diag').on('hover:enter', function () { HubLauncher.open({ view: 'diagnostics' }); });
+
+            bodyEl = $('<div class="andrprod-hub__body"></div>');
+            scroll.append(bodyEl);
+            html.append(headerEl);
+            html.append(scroll.render());
+        }
+
+        function openScopePicker() {
+            SourceRegistry.resetAndScan();
+            var adapters = SourceRegistry.getAdapters();
+            var items = [{ title: 'Все источники (общий поиск)', id: 'all', selected: scope === 'all' }];
+            var i;
+            for (i = 0; i < adapters.length; i++) {
+                var inf = adapters[i].getSourceInfo();
+                if (!StorageManager.isSourceEnabled(inf.id)) continue;
+                items.push({ title: 'Только ' + inf.name, id: inf.id, selected: scope === inf.id });
+            }
+            Lampa.Select.show({
+                title: 'Где искать',
+                items: items,
+                onSelect: function (item) {
+                    scope = item.id;
+                    headerEl.find('.andrprod-act-scope').text('Источник: ' + getScopeName(scope));
+                    Lampa.Controller.toggle('content');
+                    startSearch(false);
+                },
+                onBack: function () { Lampa.Controller.toggle('content'); }
+            });
+        }
+
+        function renderStatusAndBody(preserveFocus) {
+            if (statusEl) {
+                if (!state) statusEl.text('Нажмите «Обновить поиск» для запуска (ручной режим)');
+                else statusEl.text(state.statusText + (state.durationMs ? (' • ' + state.durationMs + ' мс') : ''));
+            }
+            renderBody(preserveFocus);
+        }
+
+        function renderBody(preserveFocus) {
+            if (isDestroyed || !bodyEl) return;
+            bodyEl.empty();
+
+            var rawResults = state ? state.results : [];
+            var filtered = FilterEngine.apply(rawResults);
+
+            bodyEl.append('<div class="andrprod-section-title">Найденные варианты (' + filtered.length + (rawResults.length !== filtered.length ? (' из ' + rawResults.length) : '') + ')</div>');
+
+            if (filtered.length) {
+                var list = $('<div class="andrprod-source-list"></div>');
+                var i;
+                for (i = 0; i < filtered.length; i++) {
+                    (function (res) {
+                        var card = $(
+                            '<div class="andrprod-source-card selector">' +
+                                '<div class="andrprod-source-card__main">' +
+                                    '<div class="andrprod-source-card__header">' +
+                                        '<span class="andrprod-plugin-tag">' + escapeHtml(res.pluginName) + '</span>' +
+                                        '<span class="andrprod-source-card__title">' + escapeHtml(res.sourceName) + '</span>' +
+                                        '<span class="andrprod-chip"><b>' + escapeHtml(res.qualityLabel) + '</b></span>' +
+                                        (res.format ? '<span class="andrprod-chip">' + escapeHtml(res.format) + '</span>' : '') +
+                                    '</div>' +
+                                    '<div class="andrprod-chips-row">' +
+                                        (res.voice ? '<span class="andrprod-chip">Озвучка: <b>' + escapeHtml(res.voice) + '</b></span>' : '') +
+                                        '<span class="andrprod-chip">Язык: <b>' + escapeHtml(res.langLabel) + '</b></span>' +
+                                        (res.hasSubtitles ? '<span class="andrprod-chip">Субтитры: <b class="is-yes">Да</b></span>' : '') +
+                                        (res.season ? '<span class="andrprod-chip">S' + escapeHtml(res.season) + (res.episode ? 'E' + escapeHtml(res.episode) : '') + '</span>' : '') +
+                                        '<span class="andrprod-chip">Воспроизведение: <b class="' + (res.canPlay ? 'is-yes' : 'is-unk') + '">' + (res.canPlay ? 'Доступно' : 'Через плагин') + '</b></span>' +
+                                    '</div>' +
+                                '</div>' +
+                                '<div class="andrprod-source-card__right"><span class="andrprod-badge is-on">▶ Смотреть</span></div>' +
+                            '</div>'
+                        );
+                        card.on('hover:enter', function () {
+                            var ad = SourceRegistry.getAdapterById(res.pluginId);
+                            if (ad && typeof ad.play === 'function') ad.play(res, mediaMeta);
+                            else launchPlaybackSafe(res, mediaMeta);
+                        });
+                        card.on('hover:focus', function () { lastFocused = card[0]; scroll.update(card, true); });
+                        list.append(card);
+                    })(filtered[i]);
+                }
+                bodyEl.append(list);
+            } else {
+                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">' + (state && state.isSearching ? 'Идёт параллельный поиск по источникам...' : 'Прямых вариантов воспроизведения не найдено') + '</div><div class="andrprod-empty__desc">Если у установленного плагина нет программного API, откройте его напрямую из списка статусов ниже.</div></div>');
+            }
+
+            // Статусы каждого источника (если включено отображение процесса поиска)
+            if (state && StorageManager.isShowProgress()) {
+                bodyEl.append('<div class="andrprod-section-title">Состояние источников (' + state.completed + '/' + state.total + ')</div>');
+                var sList = $('<div class="andrprod-source-list"></div>');
+                var sid;
+                for (sid in state.statuses) {
+                    if (!state.statuses.hasOwnProperty(sid)) continue;
+                    (function (st) {
+                        var row = $(
+                            '<div class="andrprod-source-card selector">' +
+                                '<div class="andrprod-source-card__main">' +
+                                    '<div class="andrprod-source-card__header">' +
+                                        '<span class="andrprod-status-dot ' + mapStatusDot(st.status) + '"></span>' +
+                                        '<span class="andrprod-source-card__title">' + escapeHtml(st.info.name) + '</span>' +
+                                        '<span class="andrprod-chip">' + escapeHtml(st.label) + '</span>' +
+                                    '</div>' +
+                                    (st.error ? '<div class="andrprod-source-card__sub">' + escapeHtml(st.error) + '</div>' : '') +
+                                '</div>' +
+                                '<div class="andrprod-source-card__right"><span class="andrprod-badge is-off">' + (st.status === 'unsupported' ? '▶ Открыть в плагине' : 'Инфо') + '</span></div>' +
+                            '</div>'
+                        );
+                        row.on('hover:enter', function () {
+                            if (st.status === 'unsupported') CardIntegration.launchPluginLiveButton(st.info.id);
+                            else HubLauncher.open({ view: 'sources' });
+                        });
+                        row.on('hover:focus', function () { lastFocused = row[0]; scroll.update(row, true); });
+                        sList.append(row);
+                    })(state.statuses[sid]);
+                }
+                bodyEl.append(sList);
+            }
+
+            Lampa.Controller.collectionSet(html);
+            if (!preserveFocus) {
+                var first = html.find('.selector')[0];
+                if (first) Lampa.Controller.collectionFocus(first, html);
+            }
+        }
+
+        function getScopeName(id) {
+            if (!id || id === 'all') return 'Все';
+            var ad = SourceRegistry.getAdapterById(id);
+            return ad ? ad.getSourceInfo().name : id;
+        }
+
+        this.start = function () {
+            Lampa.Controller.add('content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(html);
+                    Lampa.Controller.collectionFocus(lastFocused || html.find('.selector')[0] || false, html);
+                },
+                left: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('left')) Navigator.move('left'); else Lampa.Controller.toggle('menu'); },
+                right: function () { if (typeof Navigator !== 'undefined') Navigator.move('right'); },
+                up: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('up')) Navigator.move('up'); else Lampa.Controller.toggle('head'); },
+                down: function () { if (typeof Navigator !== 'undefined') Navigator.move('down'); },
+                back: function () { Lampa.Activity.backward(); }
+            });
+            Lampa.Controller.toggle('content');
+        };
+        this.pause = function () {};
+        this.stop = function () {};
+        this.render = function () { return html; };
+        this.destroy = function () {
+            isDestroyed = true;
+            UnifiedSearchEngine.cancelActiveSearch();
+            try { scroll.destroy(); } catch (e) {}
+            html.remove();
+        };
+    }
+
+    // =========================================================================
+    // 12. РАЗДЕЛЫ «ВЫБРАТЬ ИСТОЧНИКИ» И «ДИАГНОСТИКА» (AndrprodHubComponent)
+    // =========================================================================
+    var HubLauncher = {
+        open: function (params) {
+            params = params || {};
+            Lampa.Activity.push({
+                url: '',
+                title: PLUGIN_NAME,
+                component: HUB_COMPONENT,
+                view: params.view || 'sources',
+                page: 1
+            });
+        }
+    };
+
+    function AndrprodHubComponent(object) {
+        var currentView = (object && object.view) ? object.view : 'sources';
+        var scroll = new Lampa.Scroll({ mask: true, over: true });
+        var html = $('<div class="andrprod-hub"></div>');
+        var bodyEl = null;
+        var lastFocused = null;
+        var isDestroyed = false;
+
+        this.create = function () {
+            SourceRegistry.resetAndScan();
+            buildShell();
+            renderView();
+            return this.render();
+        };
+
+        function buildShell() {
+            html.empty();
+            var head = $(
+                '<div class="andrprod-hub__header">' +
+                    '<div class="andrprod-hub__brand">' + BrandIcons.getLogoSvg('andrprod-hub__logo', 'hub') + '</div>' +
+                    '<div class="andrprod-hub__toolbar">' +
+                        '<div class="andrprod-pill selector andrprod-tab-src">Выбрать источники</div>' +
+                        '<div class="andrprod-pill selector andrprod-tab-diag">Диагностика</div>' +
+                        '<div class="andrprod-pill selector andrprod-btn-checkall">Проверить все источники</div>' +
+                    '</div>' +
+                '</div>'
+            );
+            head.find('.andrprod-tab-src').on('hover:enter', function () { currentView = 'sources'; renderView(); });
+            head.find('.andrprod-tab-diag').on('hover:enter', function () { currentView = 'diagnostics'; renderView(); });
+            head.find('.andrprod-btn-checkall').on('hover:enter', function () {
+                if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Проверка всех источников...');
+                UnifiedSearchEngine.checkAllSources(function () {
+                    if (!isDestroyed) renderView(true);
+                }, function () {
+                    if (!isDestroyed) {
+                        renderView(true);
+                        if (Lampa.Noty) Lampa.Noty.show(PLUGIN_NAME + ': Проверка завершена.');
+                    }
+                });
+            });
+            bodyEl = $('<div class="andrprod-hub__body"></div>');
+            scroll.append(bodyEl);
+            html.append(head);
+            html.append(scroll.render());
+        }
+
+        function renderView(preserveFocus) {
+            if (isDestroyed || !bodyEl) return;
+            bodyEl.empty();
+            if (currentView === 'diagnostics') renderDiagnostics();
+            else renderSelectSources();
+
+            Lampa.Controller.collectionSet(html);
+            if (!preserveFocus) {
+                var first = bodyEl.find('.selector')[0] || html.find('.selector')[0];
+                if (first) Lampa.Controller.collectionFocus(first, html);
+            }
+        }
+
+        function renderSelectSources() {
+            var adapters = SourceRegistry.getAdapters();
+            bodyEl.append('<div class="andrprod-section-title">Выбрать источники (' + adapters.length + ')</div>');
+            if (!adapters.length) {
+                bodyEl.append('<div class="andrprod-empty"><div class="andrprod-empty__title">Онлайн-источники не обнаружены</div><div class="andrprod-empty__desc">Установите совместимые онлайн-плагины в Lampa → Настройки → Расширения.</div></div>');
+                return;
+            }
+            var list = $('<div class="andrprod-source-list"></div>');
+            var i;
+            for (i = 0; i < adapters.length; i++) {
+                (function (ad, idx) {
+                    var info = ad.getSourceInfo();
+                    var enabled = StorageManager.isSourceEnabled(info.id);
+                    var chk = Diagnostics.lastCheckResults[info.id];
+                    var row = $(
+                        '<div class="andrprod-source-card selector ' + (enabled ? '' : 'is-disabled') + '">' +
+                            '<div class="andrprod-source-card__main">' +
+                                '<div class="andrprod-source-card__header">' +
+                                    '<span class="andrprod-status-dot ' + (chk ? (chk.ok ? 'is-online' : 'is-offline') : 'is-unknown') + '"></span>' +
+                                    '<span class="andrprod-source-card__title">#' + (idx + 1) + ' ' + escapeHtml(info.name) + '</span>' +
+                                    '<span class="andrprod-chip">' + (info.integrationLevel === 'full' ? 'Полная интеграция' : 'Кнопка плагина') + '</span>' +
+                                '</div>' +
+                                '<div class="andrprod-source-card__sub">' +
+                                    (chk ? (escapeHtml(chk.message) + ' (' + chk.latency + ' мс) • ') : '') +
+                                    escapeHtml(info.reason) +
+                                '</div>' +
+                            '</div>' +
+                            '<div class="andrprod-source-card__right"><span class="andrprod-badge ' + (enabled ? 'is-on' : 'is-off') + '">' + (enabled ? 'Включён' : 'Отключён') + '</span></div>' +
+                        '</div>'
+                    );
+                    row.on('hover:enter', function () {
+                        Lampa.Select.show({
+                            title: info.name,
+                            items: [
+                                { title: enabled ? 'Отключить источник' : 'Включить источник', act: 'toggle' },
+                                { title: 'Проверить доступность', act: 'check' },
+                                { title: 'Поднять приоритет ▲', act: 'up' },
+                                { title: 'Понизить приоритет ▼', act: 'down' }
+                            ],
+                            onSelect: function (it) {
+                                if (it.act === 'toggle') StorageManager.setSourceEnabled(info.id, !enabled);
+                                else if (it.act === 'up') StorageManager.movePriority(info.id, -1);
+                                else if (it.act === 'down') StorageManager.movePriority(info.id, 1);
+                                else if (it.act === 'check') {
+                                    ad.isAvailable(function (ok, msg, lat) {
+                                        Diagnostics.lastCheckResults[info.id] = { id: info.id, name: info.name, ok: !!ok, message: msg, latency: lat, checkedAt: Date.now() };
+                                        if (Lampa.Noty) Lampa.Noty.show(info.name + ': ' + msg);
+                                        if (!isDestroyed) renderView(true);
+                                    });
+                                }
+                                renderView(true);
+                                Lampa.Controller.toggle('content');
+                            },
+                            onBack: function () { Lampa.Controller.toggle('content'); }
+                        });
+                    });
+                    row.on('hover:focus', function () { lastFocused = row[0]; scroll.update(row, true); });
+                    list.append(row);
+                })(adapters[i], i);
+            }
+            bodyEl.append(list);
+        }
+
+        function renderDiagnostics() {
+            var rep = Diagnostics.getReport();
+            var list = $('<div class="andrprod-settings-list"></div>');
+            var metrics = [
+                { k: 'Версия плагина', v: 'v' + rep.version },
+                { k: 'Состояние загрузки / инициализации', v: (rep.loaded ? 'Загружен' : 'Нет') + ' / ' + (rep.initialized ? 'Инициализирован' : 'Ошибка') },
+                { k: 'Обнаружено / Активных / Неподдерживаемых', v: rep.discoveredCount + ' / ' + rep.activeCount + ' / ' + rep.unsupportedCount },
+                { k: 'Последняя ошибка', v: rep.lastError ? ('[' + rep.lastError.module + '] ' + rep.lastError.message) : 'Нет' },
+                { k: 'Время последнего поиска', v: rep.lastSearchAt ? (formatTime(rep.lastSearchAt) + ' (' + rep.lastSearchDurationMs + ' мс, найдено: ' + rep.lastResultCount + ')') : 'Не выполнялся' }
+            ];
+            var i;
+            for (i = 0; i < metrics.length; i++) {
+                list.append('<div class="andrprod-setting-row"><div class="andrprod-setting-row__title">' + escapeHtml(metrics[i].k) + '</div><div class="andrprod-setting-row__val">' + escapeHtml(metrics[i].v) + '</div></div>');
+            }
+            bodyEl.append(list);
+
+            var chkKeys = Object.keys(rep.lastCheckResults || {});
+            if (chkKeys.length) {
+                bodyEl.append('<div class="andrprod-section-title">Результаты проверки источников (' + chkKeys.length + ')</div>');
+                var cList = $('<div class="andrprod-source-list"></div>');
+                for (i = 0; i < chkKeys.length; i++) {
+                    var c = rep.lastCheckResults[chkKeys[i]];
+                    cList.append('<div class="andrprod-source-card"><div class="andrprod-source-card__main"><div class="andrprod-source-card__header"><span class="andrprod-status-dot ' + (c.ok ? 'is-online' : 'is-offline') + '"></span><span class="andrprod-source-card__title">' + escapeHtml(c.name) + '</span></div><div class="andrprod-source-card__sub">' + escapeHtml(c.message) + ' • ' + c.latency + ' мс</div></div></div>');
+                }
+                bodyEl.append(cList);
+            }
+        }
+
+        this.start = function () {
+            Lampa.Controller.add('content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(html);
+                    Lampa.Controller.collectionFocus(lastFocused || html.find('.selector')[0] || false, html);
+                },
+                left: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('left')) Navigator.move('left'); else Lampa.Controller.toggle('menu'); },
+                right: function () { if (typeof Navigator !== 'undefined') Navigator.move('right'); },
+                up: function () { if (typeof Navigator !== 'undefined' && Navigator.canmove('up')) Navigator.move('up'); else Lampa.Controller.toggle('head'); },
+                down: function () { if (typeof Navigator !== 'undefined') Navigator.move('down'); },
+                back: function () { Lampa.Activity.backward(); }
+            });
+            Lampa.Controller.toggle('content');
+        };
+        this.pause = function () {};
+        this.stop = function () {};
+        this.render = function () { return html; };
+        this.destroy = function () { isDestroyed = true; try { scroll.destroy(); } catch (e) {} html.remove(); };
+    }
+
+    // =========================================================================
+    // 13. НАСТРОЙКИ В LAMPA (Lampa → Настройки → ANDRPROD DD)
+    // =========================================================================
+    var SettingsIntegration = {
+        init: function () {
+            if (!Lampa.SettingsApi) return;
+            try {
+                Lampa.SettingsApi.addComponent({ component: PLUGIN_ID, name: PLUGIN_NAME, icon: BrandIcons.getMiniIconSvg() });
+
+                // --- Источники ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_sources', type: 'button' },
+                    field: { name: 'Выбрать источники', description: 'Включение, отключение, приоритет и проверка доступности источников' },
+                    onChange: function () { HubLauncher.open({ view: 'sources' }); }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_checkall', type: 'button' },
+                    field: { name: 'Проверить все источники', description: 'Запустить проверку работоспособности всех источников' },
+                    onChange: function () { HubLauncher.open({ view: 'diagnostics' }); UnifiedSearchEngine.checkAllSources(); }
+                });
+
+                // --- Языки ---
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langUk, type: 'trigger', 'default': true }, field: { name: 'Язык: Украинский', description: 'Показывать варианты с украинской озвучкой' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langRu, type: 'trigger', 'default': true }, field: { name: 'Язык: Русский', description: 'Показывать варианты с русской озвучкой' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langEn, type: 'trigger', 'default': true }, field: { name: 'Язык: Английский', description: 'Отключите, чтобы скрыть английские источники и озвучку' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.langOther, type: 'trigger', 'default': true }, field: { name: 'Язык: Другие языки', description: 'Показывать остальные языки озвучки' } });
+
+                // --- Фильтрация и качество ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.minQuality, type: 'select', values: { any: 'Не имеет значения', '480p': '480p', '720p': '720p', '1080p': '1080p', '2160p': '2160p', '4k': '4K' }, 'default': 'any' },
+                    field: { name: 'Минимальное качество видео', description: 'Отсеивать варианты ниже выбранного качества' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.maxQuality, type: 'select', values: { any: 'Не имеет значения', '4k': '4K', '2160p': '2160p', '1080p': '1080p', '720p': '720p', '480p': '480p' }, 'default': 'any' },
+                    field: { name: 'Максимальное качество видео', description: 'Ограничить верхнее разрешение видео' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.prefVoice, type: 'select', values: { any: 'Любая', dub: 'Дубляж', multi: 'Многоголосая', orig: 'Оригинал' }, 'default': 'any' },
+                    field: { name: 'Предпочитаемая озвучка', description: 'Приоритетный тип озвучки при фильтрации' }
+                });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.hideUnavailable, type: 'trigger', 'default': false }, field: { name: 'Скрывать недоступные источники', description: 'Не показывать источники, не прошедшие проверку' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.hideUnmatched, type: 'trigger', 'default': true }, field: { name: 'Скрывать неподходящие варианты', description: 'Скрывать результаты с неизвестным качеством при активном фильтре' } });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.sortBy, type: 'select', values: { priority: 'По приоритету источников', quality: 'По качеству видео', speed: 'По скорости ответа', name: 'По названию' }, 'default': 'priority' },
+                    field: { name: 'Сортировка результатов', description: 'Порядок отображения найденных вариантов' }
+                });
+
+                // --- Поиск ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.searchMode, type: 'select', values: { auto: 'Автоматический поиск', manual: 'Ручной поиск', best: 'Лучший выбор' }, 'default': 'auto' },
+                    field: { name: 'Режим поиска', description: 'Автоматический запуск при открытии или ручной старт' }
+                });
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: STORAGE_KEYS.timeoutMs, type: 'select', values: { '3000': '3 сек', '6000': '6 сек', '9000': '9 сек', '12000': '12 сек' }, 'default': '6000' },
+                    field: { name: 'Таймаут источника', description: 'Защита от бесконечной загрузки при сбое источника' }
+                });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.retryOnError, type: 'trigger', 'default': true }, field: { name: 'Повторный запрос при ошибке', description: 'Одна автоматическая повторная попытка при сетевом сбое' } });
+                Lampa.SettingsApi.addParam({ component: PLUGIN_ID, param: { name: STORAGE_KEYS.showProgress, type: 'trigger', 'default': true }, field: { name: 'Отображение процесса поиска', description: 'Показывать статус каждого источника под результатами' } });
+
+                // --- Диагностика ---
+                Lampa.SettingsApi.addParam({
+                    component: PLUGIN_ID,
+                    param: { name: 'andrprod_dd_btn_diag', type: 'button' },
+                    field: { name: 'Диагностика ANDRPROD DD', description: 'Версия, статус модулей, ошибки и проверка всех источников' },
+                    onChange: function () { HubLauncher.open({ view: 'diagnostics' }); }
+                });
+            } catch (e) {
+                Diagnostics.logError('SettingsIntegration', e);
+            }
+        }
+    };
+
+    // =========================================================================
+    // 14. УТИЛИТЫ И СТИЛИ
+    // =========================================================================
+    function safeTrim(str) { return String(str || '').replace(/^\s+|\s+$/g, ''); }
+    function formatTime(ts) {
+        try {
+            var d = new Date(ts);
+            return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+        } catch (e) { return ''; }
+    }
+    function mapStatusDot(st) {
+        if (st === 'found') return 'is-online';
+        if (st === 'searching') return 'is-checking';
+        if (st === 'error') return 'is-offline';
+        if (st === 'unsupported') return 'is-ready';
+        return 'is-unknown';
+    }
+    function makeSafeId(str) {
+        return String(str || 'src').toLowerCase().replace(/^https?:\/\//, '').replace(/[^a-z0-9а-яё]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 36) || 'src_custom';
+    }
+    function extractPluginLabel(url) {
+        try {
+            var clean = String(url).split('?')[0].split('#')[0];
+            var parts = clean.split('/');
+            var file = (parts[parts.length - 1] || parts[parts.length - 2] || 'Plugin').replace(/\.js$/i, '').replace(/[_-]+/g, ' ');
+            return file ? (file.charAt(0).toUpperCase() + file.slice(1)) : 'Плагин';
+        } catch (e) { return 'Плагин'; }
+    }
+    function escapeHtml(str) {
+        return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function injectStyles() {
+        try {
+            if ($('#andrprod-dd-styles').length) return;
+            var css = '' +
+                '.andrprod-card-btn{background:transparent!important;border:none!important;box-shadow:none!important;min-width:0!important;width:auto!important;height:2.8em!important;padding:0.25em 0.55em!important;display:inline-flex!important;align-items:center;justify-content:center;overflow:visible!important;transition:transform .18s ease,filter .18s ease;}' +
+                '.andrprod-card-btn.focus,.andrprod-card-btn:hover{background:transparent!important;box-shadow:none!important;transform:scale(1.07);filter:drop-shadow(0 0 16px rgba(56,189,248,.92));}' +
+                '.andrprod-card-btn__logo{height:1.85em!important;width:auto!important;max-width:8.5em!important;display:block;overflow:visible;}' +
+                '.andrprod-menu-text{white-space:nowrap!important;overflow:visible!important;}' +
+                '.andrprod-hub{padding:1.3em 2em 2em 2em;color:#E2E8F0;}' +
+                '.andrprod-hero{display:flex;gap:1.4em;align-items:flex-start;margin-bottom:1.3em;padding:1.1em 1.3em;border-radius:1em;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);}' +
+                '.andrprod-hero__poster{width:7.2em;height:10.5em;border-radius:0.7em;background-color:rgba(255,255,255,.08);background-size:cover;background-position:center;flex-shrink:0;}' +
+                '.andrprod-hero__info{flex:1;min-width:0;}' +
+                '.andrprod-hero__logo{height:2.1em;width:auto;display:block;margin-bottom:0.35em;}' +
+                '.andrprod-hero__title{font-size:1.35em;font-weight:800;color:#F8FAFC;}' +
+                '.andrprod-hero__meta{font-size:0.9em;color:rgba(226,232,240,.72);margin-top:0.25em;}' +
+                '.andrprod-hero__status{font-size:0.9em;color:#38BDF8;font-weight:600;margin-top:0.45em;}' +
+                '.andrprod-hero__actions{display:flex;flex-wrap:wrap;gap:0.55em;margin-top:0.85em;}' +
+                '.andrprod-hub__header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1em;margin-bottom:1.1em;}' +
+                '.andrprod-hub__logo{height:2.2em;width:auto;display:block;}' +
+                '.andrprod-hub__toolbar{display:flex;align-items:center;gap:0.6em;flex-wrap:wrap;}' +
+                '.andrprod-pill{padding:0.55em 1.1em;border-radius:999px;background:rgba(255,255,255,.08);color:#F1F5F9;font-size:0.88em;font-weight:500;transition:background .15s ease,transform .15s ease;}' +
+                '.andrprod-pill.focus{background:#0EA5E9;color:#FFFFFF;transform:scale(1.04);box-shadow:0 0 0 2px #7DD3FC;}' +
+                '.andrprod-section-title{font-size:1.05em;font-weight:700;color:#7DD3FC;margin:0.9em 0 0.7em 0;}' +
+                '.andrprod-source-list{display:flex;flex-direction:column;gap:0.68em;}' +
+                '.andrprod-source-card{display:flex;align-items:center;justify-content:space-between;gap:1em;padding:0.95em 1.25em;border-radius:0.9em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.06);transition:background .15s ease,transform .15s ease,box-shadow .15s ease;}' +
+                '.andrprod-source-card.is-disabled{opacity:.5;}' +
+                '.andrprod-source-card.focus{background:rgba(14,165,233,.24);transform:scale(1.01);box-shadow:0 0 0 2px #38BDF8;}' +
+                '.andrprod-source-card__header{display:flex;align-items:center;gap:0.55em;flex-wrap:wrap;}' +
+                '.andrprod-plugin-tag{padding:0.18em 0.6em;border-radius:0.4em;background:rgba(56,189,248,.18);color:#7DD3FC;font-size:0.78em;font-weight:700;}' +
+                '.andrprod-source-card__title{font-size:1.02em;font-weight:700;color:#F8FAFC;}' +
+                '.andrprod-chips-row{display:flex;flex-wrap:wrap;gap:0.45em;margin-top:0.45em;}' +
+                '.andrprod-chip{padding:0.2em 0.55em;border-radius:0.4em;background:rgba(255,255,255,.06);font-size:0.78em;color:rgba(226,232,240,.86);}' +
+                '.andrprod-chip .is-yes{color:#4ADE80;}.andrprod-chip .is-unk{color:#94A3B8;}' +
+                '.andrprod-source-card__sub{font-size:0.81em;color:rgba(226,232,240,.62);margin-top:0.4em;}' +
+                '.andrprod-status-dot{width:0.68em;height:0.68em;border-radius:50%;display:inline-block;flex-shrink:0;}' +
+                '.andrprod-status-dot.is-online{background:#22C55E;box-shadow:0 0 8px rgba(34,197,94,.7);}' +
+                '.andrprod-status-dot.is-ready{background:#38BDF8;}.andrprod-status-dot.is-offline{background:#EF4444;}.andrprod-status-dot.is-checking{background:#F59E0B;}.andrprod-status-dot.is-unknown{background:#94A3B8;}' +
+                '.andrprod-badge{padding:0.3em 0.8em;border-radius:999px;font-size:0.8em;font-weight:700;white-space:nowrap;}' +
+                '.andrprod-badge.is-on{background:rgba(34,197,94,.18);color:#4ADE80;}.andrprod-badge.is-off{background:rgba(148,163,184,.2);color:#CBD5E1;}' +
+                '.andrprod-settings-list{display:flex;flex-direction:column;gap:0.65em;}' +
+                '.andrprod-setting-row{display:flex;align-items:center;justify-content:space-between;padding:0.95em 1.2em;border-radius:0.85em;background:rgba(255,255,255,.05);}' +
+                '.andrprod-setting-row__title{font-size:0.98em;font-weight:600;}.andrprod-setting-row__val{font-size:0.9em;font-weight:700;color:#38BDF8;margin-left:1.2em;}' +
+                '.andrprod-empty{padding:2em 1.5em;text-align:center;background:rgba(255,255,255,.04);border-radius:0.9em;}' +
+                '.andrprod-empty__title{font-size:1.08em;font-weight:600;margin-bottom:0.4em;}.andrprod-empty__desc{font-size:0.88em;color:rgba(226,232,240,.68);max-width:44em;margin:0 auto;}';
+            $('head').append('<style id="andrprod-dd-styles">' + css + '</style>');
+        } catch (e) {
+            Diagnostics.logError('injectStyles', e);
+        }
+    }
+
+    // =========================================================================
+    // 15. ПУБЛИЧНЫЙ API (window.ANDRPROD_API)
+    // =========================================================================
+    window.ANDRPROD_API = {
+        version: PLUGIN_VERSION,
+        registerAdapter: function (adapter) { return SourceRegistry.registerAdapter(adapter); },
+        getAdapters: function () { return SourceRegistry.getAdapters(); },
+        search: function (card, method, scope, force, callbacks) { return UnifiedSearchEngine.search(card, method, scope, force, callbacks); },
+        cancelSearch: function () { return UnifiedSearchEngine.cancelActiveSearch(); },
+        filterResults: function (list) { return FilterEngine.apply(list); },
+        checkAllSources: function (onEach, onDone) { return UnifiedSearchEngine.checkAllSources(onEach, onDone); },
+        getDiagnostics: function () { return Diagnostics.getReport(); },
+        storage: StorageManager
+    };
+
+    // =========================================================================
+    // 16. БЕЗОПАСНАЯ ИНИЦИАЛИЗАЦИЯ БЕЗ ЗАВИСИМОСТИ ОТ РАННЕГО jQuery
+    // =========================================================================
+    function registerManifest() {
+        try {
+            if (!Lampa.Manifest) return;
+            Lampa.Manifest.plugins = {
+                type: 'video',
+                version: PLUGIN_VERSION,
+                name: PLUGIN_NAME,
+                description: 'Единый агрегатор онлайн-источников Lampa',
+                component: HUB_COMPONENT
+            };
+            Diagnostics.manifestRegistered = true;
+        } catch (e) {
+            Diagnostics.logError('registerManifest', e);
+        }
+    }
+
+    function startPlugin() {
+        if (window.andrprod_dd_ready) return;
+        if (!window.Lampa || !window.$) {
+            Diagnostics.logError('Boot', 'Lampa или jQuery ещё не готовы');
+            return;
+        }
+
+        registerManifest();
+        injectStyles();
+
+        try {
+            if (Lampa.Component && typeof Lampa.Component.add === 'function') {
+                if (!Diagnostics.componentsRegistered.hub) {
+                    Lampa.Component.add(HUB_COMPONENT, AndrprodHubComponent);
+                    Diagnostics.componentsRegistered.hub = true;
+                }
+                if (!Diagnostics.componentsRegistered.search) {
+                    Lampa.Component.add(SEARCH_COMPONENT, AndrprodSearchComponent);
+                    Diagnostics.componentsRegistered.search = true;
+                }
+            }
+        } catch (eComp) { Diagnostics.logError('Boot.Component', eComp); }
+
+        try { SourceRegistry.resetAndScan(); } catch (eScan) { Diagnostics.logError('Boot.Scan', eScan); }
+        try { CardIntegration.init(); } catch (eCard) { Diagnostics.logError('Boot.Card', eCard); }
+        try { SettingsIntegration.init(); } catch (eSet) { Diagnostics.logError('Boot.Settings', eSet); }
+
+        if (Diagnostics.componentsRegistered.hub && Diagnostics.componentsRegistered.search) {
+            Diagnostics.loaded = true;
+            Diagnostics.initialized = true;
+            window.andrprod_dd_ready = true;
+        }
+    }
+
+    function bootstrap() {
+        if (!window.Lampa || !window.$) {
+            var attempts = 0;
+            var timer = setInterval(function () {
+                attempts++;
+                if (window.Lampa && window.$) {
+                    clearInterval(timer);
+                    bootstrap();
+                } else if (attempts >= 40) {
+                    clearInterval(timer);
+                    Diagnostics.logError('Bootstrap', 'Lampa/jQuery не обнаружены после ожидания');
+                }
+            }, 250);
+            return;
+        }
+
+        if (window.appready) {
+            startPlugin();
+        } else if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+            Lampa.Listener.follow('app', function (e) {
+                if (e && e.type === 'ready') startPlugin();
+            });
+        } else {
+            startPlugin();
+        }
+    }
+
+    bootstrap();
+})();
